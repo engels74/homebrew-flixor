@@ -1,7 +1,7 @@
 # This cask is auto-updated by the update-cask workflow.
 # Do not edit the version or sha256 lines manually.
 cask "flixor" do
-  version "beta2.4.0"
+  version "0.0.0"
   sha256 "PLACEHOLDER"
 
   url "https://github.com/engels74/homebrew-flixor/releases/download/latest/Flixor.dmg"
