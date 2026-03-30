@@ -1,0 +1,278 @@
+name: Update Cask
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: update-cask
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.check.outputs.needed }}
+      new_version: ${{ steps.upstream.outputs.new_version }}
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v6
+
+      - name: Get latest upstream release info
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Get the latest release from Flixorui/flixor (non-draft, non-prerelease)
+          RELEASE_JSON=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Flixorui/flixor/releases/latest")
+
+          TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            echo "No release found."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Find the macOS DMG asset dynamically (handle inconsistent naming)
+          DMG_URL=$(echo "$RELEASE_JSON" | jq -r '[.assets[] | select(.name | test("\\.dmg$"; "i"))][0].browser_download_url')
+
+          if [ -z "$DMG_URL" ] || [ "$DMG_URL" = "null" ]; then
+            echo "No DMG asset found in release ${TAG_NAME}."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DMG_FILENAME=$(basename "$DMG_URL")
+
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "dmg_url=${DMG_URL}" >> "$GITHUB_OUTPUT"
+          echo "dmg_filename=${DMG_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "new_version=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          echo "Upstream version: ${TAG_NAME} (DMG: ${DMG_FILENAME})"
+
+      - name: Check if update is needed
+        id: check
+        if: steps.upstream.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          NEW_VERSION="${{ steps.upstream.outputs.new_version }}"
+
+          # Extract current version from cask file
+          CURRENT_VERSION=$(grep -E '^\s*version\s+"' Casks/flixor.rb | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "Current cask version: ${CURRENT_VERSION}"
+          echo "New upstream version: ${NEW_VERSION}"
+
+          echo "previous_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
+            echo "Cask is already up to date."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update needed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download DMG from upstream release
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          DMG_URL="${{ steps.upstream.outputs.dmg_url }}"
+
+          echo "Downloading DMG from upstream release..."
+          curl -fsSL -o Flixor.dmg "$DMG_URL"
+
+          echo "DMG downloaded successfully."
+          ls -la Flixor.dmg
+
+      - name: Compute SHA256
+        id: sha
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          SHA256=$(sha256sum Flixor.dmg | awk '{print $1}')
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "SHA256: ${SHA256}"
+
+      - name: Upload DMG artifact
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Flixor-DMG
+          path: Flixor.dmg
+          retention-days: 1
+
+      - name: Upload DMG to rolling release
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${{ steps.upstream.outputs.tag_name }}"
+          NEW_VERSION="${{ steps.upstream.outputs.new_version }}"
+          PREV_VERSION="${{ steps.check.outputs.previous_version }}"
+          BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Build the changes section
+          if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$NEW_VERSION" ] && [ "$PREV_VERSION" != "PLACEHOLDER" ]; then
+            CHANGES_SECTION="### Changes
+
+          [View release notes on upstream repo](https://github.com/Flixorui/flixor/releases/tag/${TAG_NAME})"
+          else
+            CHANGES_SECTION="### Changes
+
+          _First tracked release — no previous version to compare._"
+          fi
+
+          # Compose the release body
+          RELEASE_BODY="## Flixor — Rolling Release
+
+          This is an automatically maintained rolling release. The attached DMG always reflects the latest release from the upstream [Flixor](https://github.com/Flixorui/flixor) repository.
+
+          ---
+
+          ### Build Information
+
+          | Field | Value |
+          |-------|-------|
+          | **Version** | \`${NEW_VERSION}\` |
+          | **Upstream Release** | [\`${TAG_NAME}\`](https://github.com/Flixorui/flixor/releases/tag/${TAG_NAME}) |
+          | **Updated** | \`${BUILD_TIMESTAMP}\` |
+
+          ${CHANGES_SECTION}
+
+          ---
+
+          ### Installation
+
+          \`\`\`bash
+          brew tap engels74/flixor
+          brew install --cask flixor
+          \`\`\`
+
+          > [!NOTE]
+          > This release is managed by the [update-cask workflow](https://github.com/engels74/homebrew-flixor/actions/workflows/update-cask.yml). Do not edit manually."
+
+          # Remove existing release (if any) — ignore errors on first run
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+
+          # Brief pause for GitHub to process tag deletion
+          sleep 2
+
+          # Create the rolling release
+          gh release create latest Flixor.dmg \
+            --title "Flixor (latest)" \
+            --notes "$RELEASE_BODY" \
+            --latest=false
+
+          echo "Rolling release updated for version: ${NEW_VERSION}"
+
+      - name: Update cask file
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          NEW_VERSION="${{ steps.upstream.outputs.new_version }}"
+          NEW_SHA256="${{ steps.sha.outputs.sha256 }}"
+
+          echo "Updating cask to version ${NEW_VERSION} with SHA256 ${NEW_SHA256}"
+
+          sed -i "s/^\(  version \)\".*\"/\1\"${NEW_VERSION}\"/" Casks/flixor.rb
+          sed -i "s/^\(  sha256 \)\".*\"/\1\"${NEW_SHA256}\"/" Casks/flixor.rb
+
+          echo "Updated cask file:"
+          cat Casks/flixor.rb
+
+      - name: Commit and push
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          NEW_VERSION="${{ steps.upstream.outputs.new_version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Casks/flixor.rb
+          git commit -m "Update Flixor to ${NEW_VERSION}"
+          git push
+
+  virustotal-scan:
+    name: VirusTotal Scan
+    needs: update
+    runs-on: ubuntu-latest
+    if: needs.update.outputs.updated == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: Flixor-DMG
+
+      - name: Scan with VirusTotal
+        uses: crazy-max/ghaction-virustotal@v5
+        id: virustotal
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            *.dmg
+
+      - name: Create scan results summary
+        run: |
+          {
+            echo "### VirusTotal Scan Results"
+            echo ""
+            echo "**Scan completed:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "| File | Report |"
+            echo "|------|--------|"
+            IFS=',' read -ra PAIRS <<< "${{ steps.virustotal.outputs.analysis }}"
+            for pair in "${PAIRS[@]}"; do
+              filename="${pair%%=*}"
+              url="${pair#*=}"
+              echo "| \`${filename}\` | [View VirusTotal Report](${url}) |"
+            done
+            echo ""
+            echo "---"
+            echo ""
+            echo "_Scanned automatically by the [update-cask workflow](https://github.com/engels74/homebrew-flixor/actions/workflows/update-cask.yml)._"
+          } | tee virustotal-results.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Append VirusTotal results to release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Fetch current release body
+          gh release view latest --json body --jq '.body' > current-body.md
+
+          # Combine current body with VirusTotal results
+          {
+            cat current-body.md
+            echo ""
+            echo "---"
+            echo ""
+            cat virustotal-results.md
+          } > updated-body.md
+
+          # Update the release
+          gh release edit latest --notes-file updated-body.md
+          echo "VirusTotal results appended to release notes"
