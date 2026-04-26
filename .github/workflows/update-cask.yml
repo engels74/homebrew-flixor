@@ -152,7 +152,7 @@ jobs:
           |-------|-------|
           | **Version** | \`${NEW_VERSION}\` |
           | **Upstream Release** | [\`${TAG_NAME}\`](https://github.com/Flixorui/flixor/releases/tag/${TAG_NAME}) |
-          | **Updated** | \`${BUILD_TIMESTAMP}\` |
+          | **Build Timestamp** | \`${BUILD_TIMESTAMP}\` |
 
           ${CHANGES_SECTION}
 
