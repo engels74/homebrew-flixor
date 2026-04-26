@@ -64,6 +64,8 @@ jobs:
       - name: Check if update is needed
         id: check
         if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -77,12 +79,25 @@ jobs:
 
           echo "previous_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
-          if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
+          if gh release view latest >/dev/null 2>&1; then
+            ROLLING_RELEASE_EXISTS=true
+            echo "Rolling latest release exists."
+          else
+            ROLLING_RELEASE_EXISTS=false
+            echo "Rolling latest release is missing."
+          fi
+
+          echo "rolling_release_exists=${ROLLING_RELEASE_EXISTS}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT_VERSION" != "$NEW_VERSION" ]; then
+            echo "Update needed: cask version changed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$ROLLING_RELEASE_EXISTS" != "true" ]; then
+            echo "Update needed: rolling release is missing."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
             echo "Cask is already up to date."
             echo "needed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Update needed."
-            echo "needed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download DMG from upstream release
@@ -206,8 +221,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add Casks/flixor.rb
-          git commit -m "Update Flixor to ${NEW_VERSION}"
-          git push
+          if git diff --cached --quiet; then
+            echo "No cask file changes to commit."
+          else
+            git commit -m "Update Flixor to ${NEW_VERSION}"
+            git push
+          fi
 
   virustotal-scan:
     name: VirusTotal Scan
